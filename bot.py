@@ -507,16 +507,12 @@ async def main():
     init_db()
     print("🚀 Бот запускается в режиме webhook...")
     
-    # Start webhook
-    await dp.start_webhook(
-        bot=bot,
-        webhook_path=WEBHOOK_PATH,
-        on_startup=on_startup,
-        on_shutdown=on_shutdown,
-        host="0.0.0.0",
-        port=WEBHOOK_PORT
-    )
+    # Start webhook - правильный способ для aiogram 3.x
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot, on_startup=on_startup, on_shutdown=on_shutdown)
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+
+if __name__ == "__main__":
+    asyncio.run(main())
