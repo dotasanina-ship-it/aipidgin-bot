@@ -46,7 +46,31 @@ IMAGE_SUCCESS = os.path.join(IMAGES_DIR, "Success Story.jpg")
 IMAGE_REPORT = os.path.join(IMAGES_DIR, "Operations Report.jpg")
 
 # Константы
-SIGNAL_COOLDOWN_SECONDS = 900
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv('SIGNAL_COOLDOWN_SECONDS', '900'))
+
+
+def parse_user_ids(value: str) -> set[int]:
+    user_ids: set[int] = set()
+    for part in value.split(','):
+        raw = part.strip()
+        if not raw:
+            continue
+        try:
+            user_ids.add(int(raw))
+        except ValueError:
+            logging.getLogger(__name__).warning(
+                f"Ignoring invalid user id in NO_COOLDOWN_USER_IDS: {raw}"
+            )
+    return user_ids
+
+
+NO_COOLDOWN_USER_IDS = parse_user_ids(os.getenv('NO_COOLDOWN_USER_IDS', ''))
+
+
+def is_no_cooldown_user(user_id: int) -> bool:
+    return user_id == ADMIN_ID or user_id in NO_COOLDOWN_USER_IDS
+
+
 DEFAULT_ACCURACY_MIN = 96
 DEFAULT_ACCURACY_MAX = 99
 
@@ -342,6 +366,16 @@ def get_user_stats(user_id) -> Tuple[int, int, int]:
         return received, successful, accuracy
     return 0, 0, 0
 
+
+def get_all_user_ids() -> list[int]:
+    """Получить список всех user_id из БД."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users")
+    rows = cur.fetchall()
+    conn.close()
+    return [int(row["user_id"]) for row in rows]
+
 def is_deposit_confirmed(user_id):
     """Проверить, подтвержден ли депозит пользователя (ОСНОВНАЯ ПРОВЕРКА)."""
     conn = get_db_connection()
@@ -368,6 +402,9 @@ def build_random_signal(user_id: int) -> str:
     )
 
 def get_cooldown_remaining(user_id: int) -> int:
+    if is_no_cooldown_user(user_id):
+        return 0
+
     user = get_user(user_id)
     if not user or not user["last_signal"]:
         return 0
@@ -382,12 +419,14 @@ def get_cooldown_remaining(user_id: int) -> int:
 def get_signal_key(category: str, asset: str, timeframe: str) -> str:
     return f"{category}:{asset}:{timeframe}"
 
-def get_or_create_global_signal(category: str, asset: str, timeframe: str) -> dict:
+def get_or_create_global_signal(category: str, asset: str, timeframe: str, user_id: int | None = None) -> dict:
     key = get_signal_key(category, asset, timeframe)
     now = datetime.now()
-    signal = global_signals.get(key)
-    if signal and (now - signal["created_at"]).total_seconds() < SIGNAL_COOLDOWN_SECONDS:
-        return signal
+    bypass_cache = is_no_cooldown_user(user_id) if user_id is not None else False
+    if not bypass_cache:
+        signal = global_signals.get(key)
+        if signal and (now - signal["created_at"]).total_seconds() < SIGNAL_COOLDOWN_SECONDS:
+            return signal
 
     direction_key = "up" if random.choice([True, False]) else "down"
     accuracy = random.randint(96, 98)
@@ -398,11 +437,12 @@ def get_or_create_global_signal(category: str, asset: str, timeframe: str) -> di
         "accuracy": accuracy,
         "valid_until": valid_until,
     }
-    global_signals[key] = signal
+    if not bypass_cache:
+        global_signals[key] = signal
     return signal
 
 def build_signal_text(user_id: int, category: str, asset: str, timeframe: str) -> str:
-    signal = get_or_create_global_signal(category, asset, timeframe)
+    signal = get_or_create_global_signal(category, asset, timeframe, user_id)
     return (
         f"{get_text(user_id, 'signal_guarantee')}\n\n"
         f"Asset: {asset}\n"
@@ -741,12 +781,155 @@ async def cmd_version(message: types.Message):
     """Команда /version - проверить текущую версию запущенного бота."""
     await message.answer(f"🤖 Bot version: {BOT_VERSION}\nFile: bot.py")
 
+
+@dp.message(Command("my_id"))
+async def cmd_my_id(message: types.Message):
+    """Команда /my_id - показать Telegram user_id пользователя."""
+    user_id = message.from_user.id
+    await message.answer(
+        f"🆔 Your Telegram user_id: {user_id}\n"
+        f"Set env NO_COOLDOWN_USER_IDS={user_id} and restart bot."
+    )
+
+
+@dp.message(lambda message: (message.text or "").strip().lower() in {"my id", "my_id"})
+async def text_my_id(message: types.Message):
+    """Текстовый триггер my id/my_id - показать Telegram user_id пользователя."""
+    user_id = message.from_user.id
+    await message.answer(f"🆔 Your Telegram user_id: {user_id}")
+
+
+@dp.message(Command("diag"))
+async def cmd_diag(message: types.Message):
+    """Команда /diag - диагностика доступа пользователя к сигналам."""
+    user_id = message.from_user.id
+    username = message.from_user.username or "unknown"
+    create_user(user_id, username)
+
+    user = get_user(user_id)
+    deposit_confirmed = bool(user and user["deposit_confirmed"] == 1)
+    cooldown_remaining = get_cooldown_remaining(user_id)
+    no_cooldown = is_no_cooldown_user(user_id)
+    is_admin = user_id == ADMIN_ID
+
+    selection = user_selection.get(user_id, {})
+    selected_category = selection.get("category", "-")
+    selected_asset = selection.get("asset", "-")
+    selected_timeframe = selection.get("timeframe", "-")
+
+    lines = [
+        "🛠 DIAG REPORT",
+        f"user_id: {user_id}",
+        f"username: @{username}" if username != "unknown" else "username: -",
+        f"deposit_confirmed: {deposit_confirmed}",
+        f"cooldown_remaining_sec: {cooldown_remaining}",
+        f"cooldown_default_sec: {SIGNAL_COOLDOWN_SECONDS}",
+        f"no_cooldown_whitelist: {no_cooldown}",
+        f"is_admin: {is_admin}",
+        f"selected_category: {selected_category}",
+        f"selected_asset: {selected_asset}",
+        f"selected_timeframe: {selected_timeframe}",
+        f"bot_version: {BOT_VERSION}",
+    ]
+
+    if not deposit_confirmed:
+        lines.append("hint: access blocked by deposit_confirmed=False")
+
+    await message.answer("\n".join(lines))
+
+
+@dp.message(lambda message: (message.text or "").strip().lower() == "diag")
+async def text_diag(message: types.Message):
+    """Текстовый триггер diag//diag - диагностика доступа пользователя к сигналам."""
+    await cmd_diag(message)
+
+
+@dp.message(Command("grant_deposit"))
+async def cmd_grant_deposit(message: types.Message):
+    """Команда /grant_deposit <user_id> - выдать доступ по депозиту (только админ)."""
+    admin_user_id = message.from_user.id
+    if admin_user_id != ADMIN_ID:
+        await message.answer("⛔ Not for you.")
+        logger.warning(f"⚠️ Unauthorized /grant_deposit attempt by user {admin_user_id}")
+        return
+
+    full_text = (message.text or "").strip()
+    parts = full_text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Usage:\n/grant_deposit <telegram_user_id>")
+        return
+
+    raw_user_id = parts[1].strip()
+    try:
+        target_user_id = int(raw_user_id)
+    except ValueError:
+        await message.answer("❌ Invalid user_id. Example: /grant_deposit 123456789")
+        return
+
+    create_user(target_user_id, "")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET deposit_confirmed = 1, deposit_date = ? WHERE user_id = ?",
+        (datetime.now().isoformat(), target_user_id)
+    )
+    conn.commit()
+    conn.close()
+
+    await message.answer(f"✅ deposit_confirmed = 1 for user {target_user_id}")
+    logger.info(f"✅ Admin {admin_user_id} granted deposit to user {target_user_id}")
+
 @dp.callback_query(lambda c: c.data == "stats_btn")
 async def stats_btn_callback(callback: types.CallbackQuery):
     """Backward compatibility for old inline menus that still have Stats button."""
     user_id = callback.from_user.id
     await callback.answer()
     await send_stats_message(callback.message, user_id)
+
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message):
+    """Команда /broadcast - отправка уведомления всем пользователям (только админ)."""
+    admin_user_id = message.from_user.id
+    if admin_user_id != ADMIN_ID:
+        await message.answer("⛔ Not for you.")
+        logger.warning(f"⚠️ Unauthorized /broadcast attempt by user {admin_user_id}")
+        return
+
+    full_text = (message.text or "").strip()
+    parts = full_text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(
+            "Usage:\n"
+            "/broadcast Reminder: You can complete registration and start trading now."
+        )
+        return
+
+    broadcast_text = parts[1].strip()
+    user_ids = get_all_user_ids()
+    if not user_ids:
+        await message.answer("ℹ️ No users in database yet.")
+        return
+
+    sent_count = 0
+    failed_count = 0
+
+    await message.answer(f"📣 Broadcast started for {len(user_ids)} users...")
+
+    for target_user_id in user_ids:
+        try:
+            await bot.send_message(target_user_id, broadcast_text)
+            sent_count += 1
+        except Exception as e:
+            failed_count += 1
+            logger.warning(f"Broadcast failed for user {target_user_id}: {e}")
+
+    await message.answer(
+        f"✅ Broadcast finished.\nSent: {sent_count}\nFailed: {failed_count}"
+    )
+    logger.info(
+        f"📣 Broadcast by admin {admin_user_id}: total={len(user_ids)}, sent={sent_count}, failed={failed_count}"
+    )
 
 # ✅ /make_me_deposit команда - временное подтверждение депозита (админ)
 @dp.message(Command("make_me_deposit"))
@@ -756,7 +939,9 @@ async def cmd_make_me_deposit(message: types.Message):
     username = message.from_user.username or "unknown"
 
     if user_id != ADMIN_ID:
-        await message.answer("⛔ Not for you.")
+        await message.answer(
+            "⛔ Admin only. Send /my_id to the admin so they can run /grant_deposit <your_id>."
+        )
         logger.warning(f"⚠️ Unauthorized /make_me_deposit attempt by user {user_id}")
         return
 
@@ -774,6 +959,12 @@ async def cmd_make_me_deposit(message: types.Message):
 
     await message.answer("✅ deposit_confirmed = 1. You can test Get Access now.")
     logger.info(f"✅ Admin {user_id} set deposit_confirmed = 1")
+
+
+@dp.message(lambda message: (message.text or "").strip().lower() == "make_me_deposit")
+async def text_make_me_deposit(message: types.Message):
+    """Текстовый триггер make_me_deposit//make_me_deposit (только админ)."""
+    await cmd_make_me_deposit(message)
 
 
 # ────────────────────────────────────────────────────────────────────────────
