@@ -248,10 +248,10 @@ CREATE TABLE users (
 ## 🔐 Environment Variables (.env)
 
 ```env
-BOT_TOKEN=8469399083:AAGhrVdgF8OARGB4mJET1qIAfJdEuaAsrpY
+BOT_TOKEN=PASTE_YOUR_TELEGRAM_BOT_TOKEN_HERE
 SUPPORT_USERNAME=@legendsa2
 REFERRAL_LINK=https://u3.shortink.io/register?...
-WEBHOOK_URL=https://aipidgin-bot.bothost.app
+LOG_LEVEL=WARNING
 ```
 
 ---

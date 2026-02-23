@@ -1,20 +1,4 @@
-"""
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                                                                              ║
-║                        AIPIDGINBOT - PRODUCTION VERSION                     ║
-║                    Полностью исправленный и готовый код                     ║
-║                  Совместимо с aiogram 3.25.0 (и fallback 2.x)               ║
-║                                                                              ║
-║  Содержит:                                                                   ║
-║  ✅ Проверку депозитов из БД (вместо временного администратора)            ║
-║  ✅ Исправленный add_user_to_channel (работает с aiogram 3.25.0)           ║
-║  ✅ Улучшенное логирование с полным traceback                              ║
-║  ✅ Команду /add_all_deposited для массового добавления                    ║
-║  ✅ Обработку ошибки "USER_ALREADY_PARTICIPANT"                            ║
-║  ✅ Fallback для aiogram 2.x (если потребуется)                            ║
-║                                                                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-"""
+"""AIPidginBot production bot (aiogram 3.25.0)."""
 
 import os
 import asyncio
@@ -28,6 +12,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramNetworkError
 
 # Попытаемся импортировать dotenv (опционально)
 try:
@@ -43,16 +28,13 @@ except ImportError:
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set it in environment variables.")
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'WARNING').upper()
+BOT_VERSION = os.getenv('BOT_VERSION', '2026.02.23-1')
 SUPPORT_USERNAME = os.getenv('SUPPORT_USERNAME', '@legendsa2')
 REFERRAL_LINK = os.getenv('REFERRAL_LINK', 'https://u3.shortink.io/register?utm_campaign=838786&utm_source=affiliate&utm_medium=sr&a=WQ656LRzTHSJ6J&ac=aipidgin_nigeria&code=WELCOME50')
-WEBHOOK_URL = os.getenv('WEBHOOK_URL', 'https://aipidgin-bot.bothost.app')
-WEBHOOK_PATH = '/webhook'
-WEBHOOK_PORT = 8080
 
-# ID приватного канала (получен через @getidsbot)
-CHANNEL_ID = -1003718077529  # The Thinker's Den
 ADMIN_ID = 8131080797
-INVITE_LINK = "https://t.me/+Bgyhkl25yBJkNjBk"
+PUBLIC_CHANNEL_LINK = "https://t.me/thinkersden_trading"
 DB_PATH = os.path.join(os.path.dirname(__file__), "users.db")
 DB_READY = False
 
@@ -60,7 +42,6 @@ DB_READY = False
 IMAGES_DIR = os.path.join(os.path.dirname(__file__), "images")
 IMAGE_WELCOME = os.path.join(IMAGES_DIR, "Welcome Menu.jpg")
 IMAGE_ACCESS_DENIED = os.path.join(IMAGES_DIR, "Access Denied.jpg")
-IMAGE_SIGNAL_POST = os.path.join(IMAGES_DIR, "Signal Post.jpg")
 IMAGE_SUCCESS = os.path.join(IMAGES_DIR, "Success Story.jpg")
 IMAGE_REPORT = os.path.join(IMAGES_DIR, "Operations Report.jpg")
 
@@ -115,10 +96,12 @@ TIMEFRAMES = ["M1", "M5", "M15", "H1"]
 # ────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+logging.getLogger("aiogram.dispatcher").setLevel(logging.WARNING)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -133,26 +116,64 @@ global_signals = {}
 # ────────────────────────────────────────────────────────────────────────────
 
 async def safe_edit_message(message: types.Message, text: str, **kwargs):
-    """Безопасное редактирование сообщения - игнорирует 'message is not modified'."""
+    """Safe edit for text/caption messages with fallback to new message."""
     try:
-        await message.edit_text(text, **kwargs)
+        if getattr(message, "text", None) is not None:
+            await message.edit_text(text, **kwargs)
+            return
+
+        if getattr(message, "caption", None) is not None:
+            await message.edit_caption(caption=text, **kwargs)
+            return
+
+        await message.answer(text, **kwargs)
     except Exception as e:
-        if "message is not modified" not in str(e).lower():
-            logger.error(f"❌ Error editing message: {e}")
-            raise
+        error_text = str(e).lower()
+        if "message is not modified" in error_text:
+            return
+        if "there is no text in the message to edit" in error_text:
+            await message.answer(text, **kwargs)
+            return
+        logger.error(f"❌ Error editing message: {e}")
+        raise
+
+async def show_category_from_callback(callback: types.CallbackQuery, user_id: int):
+    """Open category menu from callback for both text and photo messages."""
+    text = get_text(user_id, "select_category")
+    keyboard = category_keyboard(user_id)
+
+    if not callback.message:
+        return
+
+    try:
+        await safe_edit_message(callback.message, text, reply_markup=keyboard)
+    except Exception as e:
+        logger.warning(f"⚠️ Could not render category menu for user {user_id}: {e}")
+        await callback.message.answer(text, reply_markup=keyboard)
+
+def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Build a single practical main menu keyboard."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=get_text(user_id, "get_access_btn"), callback_data="get_access")],
+        [InlineKeyboardButton(text=get_text(user_id, "how_to_start_btn"), callback_data="how_to_start")],
+        [InlineKeyboardButton(text=get_text(user_id, "join_channel_btn"), url=PUBLIC_CHANNEL_LINK)]
+    ])
 
 # ────────────────────────────────────────────────────────────────────────────
 # ТЕКСТЫ (PIDGIN & ENGLISH)
 # ────────────────────────────────────────────────────────────────────────────
 
 PIDGIN = {
-    "welcome": "How far! I be your personal trading mentor. No be AI, no be bot — na real human wey don tear market for years. I don help plenty Naija people make steady profit. You fit be next. Oya choose wetin you want (or tap 'Register' for 50% bonus!)\n\n📞 Need help? Contact: https://t.me/legendsa2",
-    "register_bonus": "🔥 EXCLUSIVE OFFER 🔥\n\nRegister with my link and get 50% BONUS on your first deposit! Minimum deposit just $10.\n\n👉 Click below, register, come back and start winning with real strategies.",
-    "after_register": "✅ You don register! Now make your first deposit to unlock access to VIP channel and daily signals.",
-    "after_deposit": "💰 Deposit confirmed! You now have access to The Thinker's Den — my private analytical community. Click GET ACCESS to join.",
-    "signal_guarantee": "📊 PROFESSIONAL ANALYSIS 📊\nThis setup is based on market structure and volume profile. High probability.",
-    "no_register": "❌ You no register yet.\n\n👉 Registration is the first step. Use my link to get started and claim 50% bonus.",
-    "no_deposit": "❌ You no make deposit yet.\n\n👉 Minimum deposit $10 unlocks VIP channel with daily market insights and trade ideas.",
+    "welcome": "🚀 How far! Welcome to The Thinker's Den. Free channel dey open for everybody — join dey learn. To unlock premium AI signals, make minimum deposit of $10 through my link. Make we grow together! 📊",
+    "menu_caption": "🚀 **THE THINKER'S DEN**\n\n🤖 AI-powered analysis\n🎓 Education\n👑 Premium signal access after deposit\n\nChoose your next step below:",
+    "menu_plain": "🚀 The Thinker's Den\n\nChoose your next step below:",
+    "register_bonus": "🔥 EXCLUSIVE OFFER\n\nRegister with my link and get 50% bonus on your first deposit. Minimum deposit na just $10.\n\n💡 Register now, fund your account, then come back for premium AI signals.",
+    "after_register": "✅ Registration done! Next step: make deposit to unlock premium AI signals. 💰",
+    "after_deposit": "✅ Deposit confirmed! You now get access to premium AI signals. Tap Get Access to start receiving real-time analysis and trade ideas. 📊",
+    "how_to_start": "📋 *How to start:*\n\n1) 🚀 Register with my link\n2) 🔗 Join free channel\n3) 💰 Deposit minimum $10\n4) 📊 Tap *Get Access* for premium AI signals\n\n💡 Trade smart and manage risk.",
+    "signal_guarantee": "📊 AI-POWERED MARKET ANALYSIS\nThis setup is based on structure, momentum, and volume. High-probability setup — trade with discipline.",
+    "no_register": "❌ You never register yet.\n\n🚀 Start with registration first to unlock your path to premium AI signals.",
+    "no_deposit": "❌ Deposit never reflect yet.\n\n💰 Make minimum $10 deposit to unlock premium AI signals, then tap Get Access.",
     "select_category": "Choose market to analyze:",
     "select_asset": "Choose instrument:",
     "select_timeframe": "Choose timeframe:",
@@ -169,17 +190,27 @@ PIDGIN = {
     "cooldown": "⏳ Wait {} minutes {} seconds before next analysis.",
     "no_active_signal": "No active setups now. Check back later.",
     "signal_expired": "This setup expired. Wait for next opportunity.",
+    "need_deposit_caption": "❌ Deposit never confirm yet.\n\n💰 Minimum $10 deposit unlocks premium AI signals.\n🚀 Register below and claim your 50% bonus.",
+    "register_now_btn": "🚀 Register Now",
+    "register_deposit_btn": "💰 Register & Deposit",
+    "get_access_btn": "📊 Get Access",
+    "how_to_start_btn": "📋 How to Start",
+    "join_channel_btn": "🔗 Join Free Channel",
+    "ready_prompt": "Ready? 🚀",
     "back": "◀️ Back",
 }
 
 ENGLISH = {
-    "welcome": "I'm your personal trading mentor. Not an AI, not a bot — a real trader with years of experience. I've helped many Nigerians build consistent profits. You can be next. Select an option below (or tap 'Register' for 50% bonus!)\n\n📞 Need help? Contact: https://t.me/legendsa2",
-    "register_bonus": "🔥 EXCLUSIVE OFFER 🔥\n\nRegister with my link and get 50% BONUS on your first deposit! Minimum deposit just $10.\n\n👉 Click below, register, and unlock access to my VIP community.",
-    "after_register": "✅ Registration successful! Now make your first deposit to access the VIP channel and daily trade ideas.",
-    "after_deposit": "💰 Deposit confirmed! You now have access to The Thinker's Den — my private analytical community. Click GET ACCESS to join.",
-    "signal_guarantee": "📊 PROFESSIONAL ANALYSIS 📊\nThis setup is based on market structure and volume profile. High probability.",
-    "no_register": "❌ You haven't registered yet.\n\n👉 Registration is the first step. Use my link to get started and claim 50% bonus.",
-    "no_deposit": "❌ You haven't made a deposit yet.\n\n👉 Minimum deposit $10 unlocks VIP channel with daily market insights and trade ideas.",
+    "welcome": "🚀 Welcome to The Thinker's Den! The channel is free for everyone — join and learn daily. To unlock premium AI-powered signals, make a minimum deposit of $10 using my link. Let's grow together! 📊",
+    "menu_caption": "🚀 **THE THINKER'S DEN**\n\n🤖 AI-powered analysis\n🎓 Education\n👑 Premium signal access after deposit\n\nChoose your next step below:",
+    "menu_plain": "🚀 The Thinker's Den\n\nChoose your next step below:",
+    "register_bonus": "🔥 EXCLUSIVE OFFER\n\nRegister with my referral link and get a 50% bonus on your first deposit. Minimum deposit is just $10.\n\n💡 Register now, fund your account, and unlock premium AI signals.",
+    "after_register": "✅ Registration successful! Next step: make a deposit to get premium AI signals. 💰",
+    "after_deposit": "✅ Deposit confirmed! You now have access to premium AI signals. Click Get Access to start receiving real-time analysis and trade ideas. 📊",
+    "how_to_start": "📋 *How to start:*\n\n1) 🚀 Register using my link\n2) 🔗 Join the free channel\n3) 💰 Make a minimum $10 deposit\n4) 📊 Tap *Get Access* for premium AI-powered signals\n\n💡 Trade smart and manage risk.",
+    "signal_guarantee": "📊 AI-POWERED MARKET ANALYSIS\nThis setup is based on structure, momentum, and volume. High-probability setup — manage risk on every trade.",
+    "no_register": "❌ You're not registered yet.\n\n🚀 Complete registration first to unlock your premium signal path.",
+    "no_deposit": "❌ Deposit not confirmed yet.\n\n💰 Make a minimum $10 deposit to unlock premium AI signals, then tap Get Access.",
     "select_category": "Select category:",
     "select_asset": "Select instrument:",
     "select_timeframe": "Select timeframe:",
@@ -196,6 +227,13 @@ ENGLISH = {
     "cooldown": "⏳ Wait {} minutes {} seconds before next analysis.",
     "no_active_signal": "No active setups now. Check back later.",
     "signal_expired": "This setup expired. Wait for next opportunity.",
+    "need_deposit_caption": "❌ Deposit is not confirmed yet.\n\n💰 Minimum $10 deposit unlocks premium AI signals.\n🚀 Register below and claim your 50% bonus.",
+    "register_now_btn": "🚀 Register Now",
+    "register_deposit_btn": "💰 Register & Deposit",
+    "get_access_btn": "📊 Get Access",
+    "how_to_start_btn": "📋 How to Start",
+    "join_channel_btn": "🔗 Join Free Channel",
+    "ready_prompt": "Ready? 🚀",
     "back": "◀️ Back",
 }
 
@@ -304,24 +342,6 @@ def get_user_stats(user_id) -> Tuple[int, int, int]:
         return received, successful, accuracy
     return 0, 0, 0
 
-def set_user_added_to_channel(user_id):
-    """Отметить пользователя как добавленного в канал."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET added_to_channel = 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-    logger.info(f"✅ User {user_id} marked as added to channel in DB")
-
-def is_user_added_to_channel(user_id):
-    """Проверить, добавлен ли пользователь в канал."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT added_to_channel FROM users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row and row['added_to_channel'] == 1
-
 def is_deposit_confirmed(user_id):
     """Проверить, подтвержден ли депозит пользователя (ОСНОВНАЯ ПРОВЕРКА)."""
     conn = get_db_connection()
@@ -332,34 +352,6 @@ def is_deposit_confirmed(user_id):
     is_confirmed = row and row['deposit_confirmed'] == 1
     logger.info(f"Deposit check for user {user_id}: {'CONFIRMED ✅' if is_confirmed else 'NOT CONFIRMED ❌'}")
     return is_confirmed
-
-async def _telegram_api_post(method: str, payload: dict) -> dict:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    session = await bot.session.create_session()
-    async with session.post(url, json=payload) as resp:
-        data = await resp.json()
-        data["_http_status"] = resp.status
-    return data
-
-async def create_invite_link() -> str | None:
-    payload = {
-        "chat_id": CHANNEL_ID,
-        "creates_join_request": True,
-    }
-    data = await _telegram_api_post("createChatInviteLink", payload)
-    if data.get("ok"):
-        return data.get("result", {}).get("invite_link")
-    logger.error(
-        "❌ createChatInviteLink failed: %s (code %s)",
-        data.get("description"),
-        data.get("error_code"),
-    )
-    return None
-
-async def get_invite_link() -> str | None:
-    if INVITE_LINK:
-        return INVITE_LINK
-    return await create_invite_link()
 
 def build_random_signal(user_id: int) -> str:
     direction_key = "up" if random.choice([True, False]) else "down"
@@ -424,13 +416,26 @@ def build_signal_text(user_id: int, category: str, asset: str, timeframe: str) -
 async def send_signal(callback: types.CallbackQuery, user_id: int):
     selection = user_selection.get(user_id)
     if not selection:
-        await safe_edit_message(callback.message, get_text(user_id, "select_category"))
+        await callback.answer()
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.message.answer(
+            get_text(user_id, "select_category"),
+            reply_markup=category_keyboard(user_id),
+        )
         return
 
     remaining = get_cooldown_remaining(user_id)
     if remaining > 0:
         mins, secs = divmod(remaining, 60)
-        await safe_edit_message(callback.message, get_text(user_id, "cooldown").format(mins, secs))
+        await callback.answer()
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.message.answer(get_text(user_id, "cooldown").format(mins, secs))
         return
 
     update_user_signal(user_id)
@@ -443,15 +448,7 @@ async def send_signal(callback: types.CallbackQuery, user_id: int):
     
     await callback.answer()  # Закрываем callback
     await callback.message.delete()  # Удаляем предыдущее сообщение
-    try:
-        photo = FSInputFile(IMAGE_SIGNAL_POST)
-        await callback.message.answer_photo(
-            photo=photo,
-            caption=signal_text,
-            reply_markup=keyboard
-        )
-    except FileNotFoundError:
-        await callback.message.answer(signal_text, reply_markup=keyboard)
+    await callback.message.answer(signal_text, reply_markup=keyboard)
     logger.info(f"📊 Sent global signal to user {user_id}")
 
 def category_keyboard(user_id: int) -> InlineKeyboardMarkup:
@@ -477,25 +474,6 @@ def timeframe_keyboard(category: str, asset: str, user_id: int = 0) -> InlineKey
         rows.append([InlineKeyboardButton(text=tf, callback_data=f"tf:{category}:{asset}:{tf}")])
     rows.append([InlineKeyboardButton(text=get_text(user_id, "back"), callback_data="back:asset")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
-# ────────────────────────────────────────────────────────────────────────────
-# ⭐️ ГЛАВНАЯ ФУНКЦИЯ: ДОБАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯ В КАНАЛ
-# ────────────────────────────────────────────────────────────────────────────
-
-async def add_user_to_channel(user_id: int) -> bool:
-    """
-    Добавляет пользователя в канал через invite link (прямое добавление не работает для каналов).
-    Пользователь будет добавлен автоматически при подтверждении join request.
-    """
-    try:
-        logger.info(f"🔄 User {user_id} will be added via invite link approval")
-        # Прямое добавление в каналы не работает (404), используем invite link + auto-approve
-        return True
-    
-    except Exception as e:
-        logger.error(f"❌ Error in add_user_to_channel for user {user_id}: {e}")
-        return False
-
 
 # ────────────────────────────────────────────────────────────────────────────
 # ОБРАБОТЧИКИ СОБЫТИЙ (HANDLERS)
@@ -533,139 +511,70 @@ async def set_language(callback: types.CallbackQuery):
 
 async def show_main_menu(message: types.Message, user_id: int):
     """Показать главное меню с картинкой Welcome Menu."""
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Get Access", callback_data="get_access")],
-        [InlineKeyboardButton(text="👑 VIP Channel", callback_data="vip_channel")],
-        [InlineKeyboardButton(text="📋 How to Start", callback_data="how_to_start")]
-    ])
+    keyboard = main_menu_keyboard(user_id)
     
     try:
         photo = FSInputFile(IMAGE_WELCOME)
         await message.answer_photo(
             photo=photo,
-            caption="🚀 **THE THINKER'S DEN**\n\nYour personal trading mentor. Choose an option:",
+            caption=get_text(user_id, "menu_caption"),
             parse_mode="Markdown",
             reply_markup=keyboard
         )
     except FileNotFoundError:
-        await message.answer("Choose an option:", reply_markup=keyboard)
+        await message.answer(get_text(user_id, "menu_plain"), reply_markup=keyboard)
 
-# 🎯 GET ACCESS кнопка - ГЛАВНАЯ ЛОГИКА
 @dp.callback_query(lambda c: c.data == "get_access")
 async def get_access(callback: types.CallbackQuery):
-    """Callback: кнопка GET ACCESS - проверяет депозит и добавляет в канал."""
+    """Callback: checks deposit and opens signal category selection."""
     user_id = callback.from_user.id
     logger.info(f"📌 User {user_id} clicked 'Get Access'")
     
-    # ✅ ГЛАВНАЯ ПРОВЕРКА: Есть ли подтвержденный депозит?
     if is_deposit_confirmed(user_id):
-        await callback.answer()  # Закрываем callback
-        await callback.message.delete()  # Удаляем фото-сообщение
-        await callback.message.answer(
-            get_text(user_id, "select_category"),
-            reply_markup=category_keyboard(user_id),
-        )
+        await show_category_from_callback(callback, user_id)
+        await callback.answer()
     else:
-        # Нет депозита - показываем регистрацию
         logger.info(f"❌ User {user_id} NO deposit, showing registration prompt")
         
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🚀 Register now", url=REFERRAL_LINK)]
+            [InlineKeyboardButton(text=get_text(user_id, "register_now_btn"), url=REFERRAL_LINK)],
+            [InlineKeyboardButton(text=get_text(user_id, "back"), callback_data="back:main")]
         ])
-        await callback.answer()  # Закрываем callback
-        await callback.message.delete()  # Удаляем фото-сообщение
+        await callback.answer()
         try:
             photo = FSInputFile(IMAGE_ACCESS_DENIED)
             await callback.message.answer_photo(
                 photo=photo,
-                caption="❌ You need to register and make a deposit first.\n\n"
-                        "👉 Click below to register and get 50% bonus.",
+                caption=get_text(user_id, "need_deposit_caption"),
                 reply_markup=keyboard
             )
         except FileNotFoundError:
             await callback.message.answer(
-                "❌ You need to register and make a deposit first.\n\n"
-                "👉 Click below to register and get 50% bonus.",
+                get_text(user_id, "need_deposit_caption"),
                 reply_markup=keyboard
             )
         return
-    
-    await callback.answer()
 
 # ℹ️ How to Start кнопка
 @dp.callback_query(lambda c: c.data == "how_to_start")
 async def how_to_start(callback: types.CallbackQuery):
     """Callback: информация как начать работу."""
     user_id = callback.from_user.id
-    text = (
-        "📋 *How to start:*\n\n"
-        "1. Register on Pocket Option via the button below.\n"
-        "2. Make your first deposit (minimum $10) and claim 50% bonus.\n"
-        "3. After deposit, you'll automatically gain access to my VIP channel with daily market insights.\n\n"
-        f"👉 [Register Here]({REFERRAL_LINK})"
-    )
+    text = f"{get_text(user_id, 'how_to_start')}\n\n👉 [Register Here]({REFERRAL_LINK})"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Register now", url=REFERRAL_LINK)]
+        [InlineKeyboardButton(text=get_text(user_id, "register_now_btn"), url=REFERRAL_LINK)],
+        [InlineKeyboardButton(text=get_text(user_id, "join_channel_btn"), url=PUBLIC_CHANNEL_LINK)],
+        [InlineKeyboardButton(text=get_text(user_id, "back"), callback_data="back:main")]
     ])
     await callback.answer()  # Закрываем callback
     await callback.message.delete()  # Удаляем фото-сообщение
     await callback.message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
 
-# 👑 VIP CHANNEL - ПРИСОЕДИНЕНИЕ К ПРИВАТНОМУ КАНАЛУ
 @dp.callback_query(lambda c: c.data == "vip_channel")
 async def vip_channel(callback: types.CallbackQuery):
-    """Callback: кнопка VIP Channel - показывает invite link на канал."""
-    user_id = callback.from_user.id
-    logger.info(f"👑 User {user_id} clicked 'VIP Channel'")
-    
-    if is_deposit_confirmed(user_id):
-        # Депозит подтвержден - показываем invite link
-        logger.info(f"✅ User {user_id} has confirmed deposit, sending channel invite link")
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📢 Join The Thinker's Den", url=INVITE_LINK)]
-        ])
-        
-        msg_text = (
-            "🔓 **Your VIP Channel Access is Ready!**\n\n"
-            "Click below to join **The Thinker's Den** — my private analytical community.\n\n"
-            "📊 Inside you'll find:\n"
-            "• Daily market analysis & trade setups\n"
-            "• Real-time trading alerts\n"
-            "• Professional trading insights\n\n"
-            "💡 Click the button to join now!"
-        )
-        
-        await callback.answer()  # Закрываем callback
-        await callback.message.delete()  # Удаляем фото-сообщение
-        await callback.message.answer(msg_text, parse_mode="Markdown", reply_markup=keyboard)
-        await add_user_to_channel(user_id)  # Автоматически добавляем
-    else:
-        # Нет депозита - показываем регистрацию
-        logger.info(f"❌ User {user_id} NO deposit, cannot access VIP channel")
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🚀 Register & Deposit", url=REFERRAL_LINK)]
-        ])
-        await callback.answer()  # Закрываем callback
-        await callback.message.delete()  # Удаляем фото-сообщение
-        try:
-            photo = FSInputFile(IMAGE_ACCESS_DENIED)
-            await callback.message.answer_photo(
-                photo=photo,
-                caption="❌ You need to register and make a deposit first.\n\n"
-                        "👉 Click below to register and claim 50% bonus on your first deposit.",
-                reply_markup=keyboard
-            )
-        except FileNotFoundError:
-            await callback.message.answer(
-                "❌ You need to register and make a deposit first.\n\n"
-                "👉 Click below to register and claim 50% bonus on your first deposit.",
-                reply_markup=keyboard
-            )
-        return
-    
-    await callback.answer()
+    """Legacy callback compatibility: route old 'Signal Access' button to Get Access flow."""
+    logger.info(f"📈 User {callback.from_user.id} clicked legacy 'Signal Access' button")
+    await get_access(callback)
 
 @dp.callback_query(lambda c: c.data.startswith("cat:"))
 async def select_category(callback: types.CallbackQuery):
@@ -724,7 +633,7 @@ async def select_timeframe(callback: types.CallbackQuery):
     ])
     await safe_edit_message(
         callback.message,
-        f"{get_text(user_id, 'select_timeframe')} {timeframe}\n\nReady?",
+        f"{get_text(user_id, 'select_timeframe')} {timeframe}\n\n{get_text(user_id, 'ready_prompt')}",
         reply_markup=keyboard,
     )
     await callback.answer()
@@ -740,17 +649,13 @@ async def back_to_main(callback: types.CallbackQuery):
     """Вернуться в главное меню."""
     user_id = callback.from_user.id
     user_selection.pop(user_id, None)  # Очистить выбор при возврате в меню
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Get Access", callback_data="get_access")],
-        [InlineKeyboardButton(text="📊 Stats", callback_data="stats_btn")],
-    ])
-    await safe_edit_message(
-        callback.message,
-        get_text(user_id, "after_deposit"),
-        reply_markup=keyboard
-    )
-    logger.info(f"🔙 User {user_id} back to main menu")
     await callback.answer()
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await show_main_menu(callback.message, user_id)
+    logger.info(f"🔙 User {user_id} back to main menu")
 
 @dp.callback_query(lambda c: c.data == "back:category")
 async def back_to_category(callback: types.CallbackQuery):
@@ -799,11 +704,8 @@ async def back_to_asset(callback: types.CallbackQuery):
     
     await callback.answer()
 
-# 📊 /stats команда - статистика пользователя
-@dp.message(Command("stats"))
-async def cmd_stats(message: types.Message):
-    """Команда /stats - показать личную статистику."""
-    user_id = message.from_user.id
+async def send_stats_message(message: types.Message, user_id: int):
+    """Send personal stats to a user message context."""
     received, successful, accuracy = get_user_stats(user_id)
     
     # Выбираем изображение в зависимости от accuracy
@@ -826,6 +728,25 @@ async def cmd_stats(message: types.Message):
         await message.answer(text, parse_mode="Markdown")
     
     logger.info(f"📊 Stats requested by user {user_id}")
+
+# 📊 /stats команда - статистика пользователя
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    """Команда /stats - показать личную статистику."""
+    user_id = message.from_user.id
+    await send_stats_message(message, user_id)
+
+@dp.message(Command("version"))
+async def cmd_version(message: types.Message):
+    """Команда /version - проверить текущую версию запущенного бота."""
+    await message.answer(f"🤖 Bot version: {BOT_VERSION}\nFile: bot.py")
+
+@dp.callback_query(lambda c: c.data == "stats_btn")
+async def stats_btn_callback(callback: types.CallbackQuery):
+    """Backward compatibility for old inline menus that still have Stats button."""
+    user_id = callback.from_user.id
+    await callback.answer()
+    await send_stats_message(callback.message, user_id)
 
 # ✅ /make_me_deposit команда - временное подтверждение депозита (админ)
 @dp.message(Command("make_me_deposit"))
@@ -851,208 +772,42 @@ async def cmd_make_me_deposit(message: types.Message):
     conn.commit()
     conn.close()
 
-    await message.answer("✅ Теперь deposit_confirmed = 1. Можешь проверять Get Access!")
+    await message.answer("✅ deposit_confirmed = 1. You can test Get Access now.")
     logger.info(f"✅ Admin {user_id} set deposit_confirmed = 1")
 
-# 🧪 /debug_add_to_channel команда - диагностика добавления в канал (админ)
-@dp.message(Command("debug_add_to_channel"))
-async def cmd_debug_add_to_channel(message: types.Message):
-    """Команда /debug_add_to_channel - отладка добавления в канал (только админ)."""
-    user_id = message.from_user.id
-    if user_id != ADMIN_ID:
-        await message.answer("⛔ Not for you.")
-        logger.warning(f"⚠️ Unauthorized /debug_add_to_channel attempt by user {user_id}")
-        return
-
-    lines = [
-        "🔍 Debug info:",
-        f"- Channel ID: {CHANNEL_ID}",
-        f"- bot.add_chat_member exists? {'Yes' if hasattr(bot, 'add_chat_member') else 'No'}",
-        f"- Type of bot: {type(bot)}",
-    ]
-
-    # Проверка доступа к каналу и статуса бота
-    bot_is_admin = "Unknown"
-    bot_member_status = "Unknown"
-    try:
-        chat = await bot.get_chat(CHANNEL_ID)
-        lines.append(f"- get_chat: OK (type={chat.type})")
-
-        me = await bot.get_me()
-        member = await bot.get_chat_member(CHANNEL_ID, me.id)
-        bot_member_status = getattr(member, "status", "Unknown")
-        bot_is_admin = "Yes" if bot_member_status in {"administrator", "creator"} else "No"
-        lines.append(f"- Bot member status: {bot_member_status}")
-        lines.append(f"- Bot is admin? {bot_is_admin}")
-    except Exception as e:
-        lines.append("- get_chat/get_chat_member: FAIL")
-        lines.append(f"- Exception type: {type(e).__name__}")
-        lines.append(f"- Error details: {e}")
-
-    # Попытка добавления пользователя (с деталями)
-    try:
-        add_ok = await add_user_to_channel(user_id)
-        add_result_ok = "SUCCESS" if add_ok else "FAIL"
-        lines.append("- Add method: Invite Link + Auto-Approve")
-        lines.append(f"- Add attempt: {add_result_ok}")
-        lines.append("- Details: Check console logs")
-    except Exception as e:
-        lines.append("- Add method: Invite Link + Auto-Approve")
-        lines.append("- Add attempt: FAIL")
-        lines.append(f"- Exception type: {type(e).__name__}")
-        lines.append(f"- Error details: {e}")
-
-@dp.chat_join_request()
-async def approve_join_request(join_request: types.ChatJoinRequest):
-    """Авто-одобрение заявок на вступление в канал."""
-    if join_request.chat.id != CHANNEL_ID:
-        return
-    data = await _telegram_api_post(
-        "approveChatJoinRequest",
-        {"chat_id": CHANNEL_ID, "user_id": join_request.from_user.id},
-    )
-    if data.get("ok"):
-        set_user_added_to_channel(join_request.from_user.id)
-        logger.info(f"✅ Approved join request for user {join_request.from_user.id}")
-    else:
-        logger.error(
-            "❌ approveChatJoinRequest failed for user %s: %s (code %s)",
-            join_request.from_user.id,
-            data.get("description"),
-            data.get("error_code"),
-        )
-
-# ⭐️ /add_all_deposited команда - МАССОВОЕ ДОБАВЛЕНИЕ
-@dp.message(Command("add_all_deposited"))
-async def cmd_add_all_deposited(message: types.Message):
-    """
-    Команда /add_all_deposited - МАССОВОЕ ДОБАВЛЕНИЕ всех пользователей с подтвержденным депозитом.
-    
-    Только для администратора! Выбирает всех пользователей с:
-    - deposit_confirmed = 1
-    - added_to_channel = 0
-    
-    Добавляет их по очереди с задержкой 0.4 сек (защита от flood limit).
-    """
-    user_id = message.from_user.id
-    logger.info(f"👨‍💼 Admin command /add_all_deposited requested by user {user_id}")
-    
-    # ✅ Проверка прав администратора
-    if user_id != ADMIN_ID:
-        await message.answer("❌ You do not have permission to use this command.")
-        logger.warning(f"⚠️ Unauthorized /add_all_deposited attempt by user {user_id}")
-        return
-    
-    logger.info(f"✅ Admin {user_id} authorized. Starting bulk add operation...")
-    
-    # Получить всех пользователей с депозитом, но не добавленных в канал
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT user_id FROM users WHERE deposit_confirmed = 1 AND added_to_channel = 0"
-    )
-    users_to_add = cur.fetchall()
-    conn.close()
-    
-    if not users_to_add:
-        await message.answer("✅ No users to add (all deposited users already in channel).")
-        logger.info("✅ No users to add")
-        return
-    
-    total_users = len(users_to_add)
-    await message.answer(f"🔄 Starting bulk add for {total_users} users...")
-    logger.info(f"🔄 Starting bulk add for {total_users} users")
-    
-    success_count = 0
-    error_count = 0
-    errors_log = []
-    
-    # Добавляем пользователей по одному с задержкой
-    for idx, user_row in enumerate(users_to_add, 1):
-        target_user_id = user_row['user_id'] if isinstance(user_row, sqlite3.Row) else user_row[0]
-        
-        try:
-            status_msg = f"  [{idx}/{total_users}] Adding user {target_user_id}..."
-            logger.info(status_msg)
-            
-            success = await add_user_to_channel(target_user_id)
-            
-            if success:
-                success_count += 1
-                logger.info(f"    ✅ Success")
-            else:
-                error_count += 1
-                error_msg = f"User {target_user_id}: Failed to add"
-                errors_log.append(error_msg)
-                logger.warning(f"    ❌ {error_msg}")
-            
-            # Задержка для избежания flood limit (0.4 сек между запросами)
-            await asyncio.sleep(0.4)
-            
-        except Exception as e:
-            error_count += 1
-            error_msg = f"User {target_user_id}: {str(e)[:50]}"
-            errors_log.append(error_msg)
-            logger.error(f"    ❌ Exception: {error_msg}", exc_info=True)
-            await asyncio.sleep(0.4)
-    
-    # Формируем и отправляем результат
-    result_text = (
-        f"✅ Bulk add completed!\n\n"
-        f"✔️ Successful: {success_count}\n"
-        f"❌ Errors: {error_count}"
-    )
-    
-    # Показываем частичный список ошибок (максимум 5)
-    if errors_log:
-        result_text += "\n\n🔍 Error details:\n" + "\n".join(errors_log[:5])
-        if len(errors_log) > 5:
-            result_text += f"\n... and {len(errors_log) - 5} more errors"
-    
-    await message.answer(result_text)
-    logger.info(f"\n📊 === BULK ADD SUMMARY ===")
-    logger.info(f"   Total processed: {total_users}")
-    logger.info(f"   Successful: {success_count}")
-    logger.info(f"   Errors: {error_count}")
-    logger.info(f"   Success rate: {round(success_count/total_users*100, 1)}%")
 
 # ────────────────────────────────────────────────────────────────────────────
-# WEBHOOK & STARTUP
+# STARTUP
 # ────────────────────────────────────────────────────────────────────────────
-
-async def on_startup():
-    """Запуск webhook при старте бота."""
-    webhook_url = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
-    try:
-        await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-        logger.info(f"✅ Webhook установлен: {webhook_url}")
-    except Exception as e:
-        logger.error(f"❌ Webhook error: {e}", exc_info=True)
-
-async def on_shutdown():
-    """Завершение webhook при остановке бота."""
-    try:
-        await bot.delete_webhook()
-        logger.info("✅ Webhook удален")
-    except Exception as e:
-        logger.error(f"❌ Error deleting webhook: {e}")
 
 async def main():
     """Главная функция запуска бота."""
     init_db()
-    logger.info("🚀 ════════════════════════════════════════")
-    logger.info("🚀 AIPidginBot is starting (POLLING MODE)")
-    logger.info("🚀 ════════════════════════════════════════")
-    logger.info(f"📊 Channel ID: {CHANNEL_ID}")
-    logger.info(f"🔐 Bot Token: {BOT_TOKEN[:20]}...")
-    logger.info(f"🌐 aiogram version: 3.25.0 (optimized)")
-    logger.info("🚀 ════════════════════════════════════════")
+    logger.info("🚀 AIPidginBot starting in polling mode")
+    logger.info(f"🏷️ Bot version: {BOT_VERSION}")
+    logger.info(f"📊 Public channel link: {PUBLIC_CHANNEL_LINK}")
+    logger.info("🌐 aiogram version: 3.25.0 (optimized)")
     
-    # Удаляем старый webhook и запускаем polling
-    await bot.delete_webhook(drop_pending_updates=True)
-    
-    # Запуск polling
-    await dp.start_polling(bot, on_startup=on_startup, on_shutdown=on_shutdown)
+    # Чистый polling режим: webhook должен быть отключен
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except TelegramNetworkError as e:
+        logger.warning(f"⚠️ Could not delete webhook due to network issue: {e}")
+
+    # Устойчивый polling: не выходим при кратковременных сетевых сбоях
+    retry_delay = 3
+    try:
+        while True:
+            try:
+                await dp.start_polling(bot, close_bot_session=False)
+                break
+            except TelegramNetworkError as e:
+                logger.warning(f"🌐 Network issue while polling: {e}. Retrying in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+            except Exception:
+                raise
+    finally:
+        await bot.session.close()
 
 # ────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
