@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backups
+*_backup*.py
+*_old.py
+
+# Logs
+*.log
+
+# Temporary documentation
+*_FIX*.md
+*_REPORT.md
+CHANGELOG.md
+DEPLOYMENT.md
+INDEX.md
+START_HERE.md
+SUMMARY.md
+WINDOWS_SETUP_GUIDE.md
+00_PLEASE_READ_FIRST.txt
+READY_TO_USE.txt
+
+# Test files
+test_*.py
+patch_*.py
